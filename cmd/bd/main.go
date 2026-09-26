@@ -229,13 +229,6 @@ func effectiveRootStorePolicy(cmdName string, strictReadonly bool) rootStorePoli
 	}
 }
 
-// backendSupportsStrictReadonly reports whether the live backend path can open
-// without provisioning or lifecycle changes. Unsupported SQL backends are
-// rejected earlier by validateConfiguredBackend; proxied Dolt remains writable-only.
-func backendSupportsStrictReadonly(cfg *configfile.Config) bool {
-	return cfg == nil || !cfg.IsDoltProxiedServerMode()
-}
-
 // runsPostCommandMaintenance reports whether PersistentPostRunE should run the
 // post-command maintenance net — Dolt auto-commit, the tip-metadata commit,
 // auto-backup, auto-export and auto-push.
@@ -367,15 +360,27 @@ func isForcedMigrate(cmd *cobra.Command) bool {
 // open targets `beads_global`, so the block's `bd migrate schema` would
 // migrate the PROJECT database and leave the refusal in place — the working
 // remedy is the same verb with the same flag.
-func printGlobalDatabaseConsentHint(w io.Writer) {
+//
+// It takes the refusal because "the same verb" is not the same verb on every
+// arm: the #6575 data-behind stop on a shared store is remote-backed by
+// construction, and there the bare verb's consent is never read (see
+// schema.SharedConsentCommandForced), so retargeting the bare form would hand
+// the operator a global-scoped command that still cannot succeed. This mirrors
+// the retarget in handleRemoteMigrateGateJSON. A nil error keeps the
+// pre-existing bare-verb wording.
+func printGlobalDatabaseConsentHint(w io.Writer, e *schema.RemoteMigrateGateError) {
 	if !globalFlag {
 		return
+	}
+	consent := schema.SharedConsentCommandGlobal
+	if e != nil && e.IsDataBehind() && e.Shared {
+		consent = schema.SharedConsentCommandForcedGlobal
 	}
 	fmt.Fprintf(w,
 		"\n  This command targeted the global database (--global), so run the\n"+
 			"  migrate step with the same flag:\n"+
 			"        %s\n",
-		schema.SharedConsentCommandGlobal)
+		consent)
 }
 
 // renderTypedOpenError prints the actionable block for the store-open failures
@@ -405,7 +410,7 @@ func renderTypedOpenError(err error) bool {
 			handleRemoteMigrateGateJSON(gateErr)
 		} else {
 			fmt.Fprint(os.Stderr, gateErr.UserMessage())
-			printGlobalDatabaseConsentHint(os.Stderr)
+			printGlobalDatabaseConsentHint(os.Stderr, gateErr)
 		}
 		return true
 	}
@@ -730,6 +735,17 @@ func prepareSelectedNoDBContext(beadsDir string) {
 	prepareSelectedCommandContext(beadsDir, true)
 }
 
+func commandJSONFlagChanged(cmd *cobra.Command) bool {
+	if cmd == nil {
+		return false
+	}
+	if cmd.Flags().Changed("json") {
+		return true
+	}
+	root := cmd.Root()
+	return root != nil && root.PersistentFlags().Changed("json")
+}
+
 // refreshBoundCommandConfig reapplies config-backed defaults after the command
 // context has been rebound to a resolved target beads directory. This keeps
 // explicit flags authoritative while letting rerouted/explicit-db commands use
@@ -742,7 +758,7 @@ func refreshBoundCommandConfig(cmd *cobra.Command) {
 	if root == nil {
 		root = cmd
 	}
-	if !root.PersistentFlags().Changed("json") && !root.PersistentFlags().Changed("format") {
+	if !commandJSONFlagChanged(cmd) && !root.PersistentFlags().Changed("format") {
 		jsonOutput = config.GetBool("json")
 	}
 	if !root.PersistentFlags().Changed("readonly") {
@@ -1084,8 +1100,14 @@ var rootCmd = &cobra.Command{
 				jsonOutput = true
 			}
 		}
-		// If flag wasn't explicitly set, use viper value
-		if !cmd.Root().PersistentFlags().Changed("json") && !cmd.Root().PersistentFlags().Changed("format") {
+		// If flag wasn't explicitly set, use viper value.
+		//
+		// SHADOWING HAZARD (GH#6278): this reads the ROOT persistent --format
+		// only, so a subcommand that registers its own local --format shadows
+		// it here and still gets `json: true` promoted over the format it was
+		// asked for. `bd list` compensates in gatherListInput; any new local
+		// --format registration needs the same treatment or this fires again.
+		if !commandJSONFlagChanged(cmd) && !cmd.Root().PersistentFlags().Changed("format") {
 			jsonOutput = config.GetBool("json")
 		} else {
 			flagOverrides["json"] = struct {
@@ -1280,17 +1302,17 @@ var rootCmd = &cobra.Command{
 					fmt.Fprintf(os.Stderr, "warning: %v\n", err)
 				}
 			}
-			if cmdName == "doctor" && usesProxiedServer() {
-				// Refuse only on a real refusal. validateProxyMaintenance...
+			if beadsDir == "" {
+				beadsDir = beads.FindBeadsDir()
+			}
+			if commandRegistryPath(cmd) == "doctor" && usesProxiedServer() {
+				// Refuse only on a real refusal. The registry validator
 				// returns nil for doctor subcommands, and returning early on
 				// that would skip the legacy-store guard and autocommit-mode
 				// resolution every other skipsStoreInit command still runs.
-				if err := validateProxyMaintenanceBeforeProvider(cmd); err != nil {
+				if err := validateProxyRegistryBeforeProvider(cmd, resolveProxiedTopology(beadsDir)); err != nil {
 					return err
 				}
-			}
-			if beadsDir == "" {
-				beadsDir = beads.FindBeadsDir()
 			}
 			if err := guardLegacyNoStoreCommand(cmd, beadsDir); err != nil {
 				isMigrationCommand := false
@@ -1492,14 +1514,13 @@ var rootCmd = &cobra.Command{
 		}
 		// Reject proxy capability combinations before any workspace side effect
 		// (version tracking, migration, auto-start, or provider construction).
+		// Two validators, one for each half of the policy: flag-keyed rules and
+		// the path-keyed capability registry.
 		if cfg != nil && cfg.IsDoltProxiedServerMode() {
 			if err := validateProxyCapabilitiesBeforeProvider(cmd); err != nil {
 				return err
 			}
-			if err := validateProxyMaintenanceBeforeProvider(cmd); err != nil {
-				return err
-			}
-			if err := validateProxyTransformBeforeProvider(cmd); err != nil {
+			if err := validateProxyRegistryBeforeProvider(cmd, resolveProxiedTopology(beadsDir)); err != nil {
 				return err
 			}
 		}
@@ -1509,9 +1530,6 @@ var rootCmd = &cobra.Command{
 		// front-door refusals.
 		if readonlyMode && cfg != nil && cfg.IsDoltProxiedServerMode() {
 			return HandleProxyCapabilityError(AssertProxyCapability(ProxyModeProxied, ProxyCapReadonly))
-		}
-		if readonlyMode && !backendSupportsStrictReadonly(cfg) {
-			return HandleError("strict readonly is unavailable for dolt proxied-server backend; refusing to open a store that cannot guarantee mutation-free access")
 		}
 
 		// Set actor for audit trail
